@@ -56,8 +56,15 @@ jobs:
           defaults -currentHost write com.apple.screensaver idleTime 0 || true
           nohup caffeinate -dimsu >/dev/null 2>&1 &
 
-          # Local account password (needed if the client asks for a macOS login)
-          sudo dscl . -passwd "/Users/$USER" "$VNC_PASSWORD" || true
+          # Local account password (needed if the client asks for a macOS login).
+          # dscl -passwd can fail with eDSAuthFailed even under sudo on this
+          # image; sysadminctl is the reliable way to force-reset it as root.
+          sudo sysadminctl -resetPasswordFor "$USER" -newPassword "$VNC_PASSWORD" 2>&1 | tee "$RUNNER_TEMP/pwreset.log" || true
+          if dscl . -authonly "$USER" "$VNC_PASSWORD" 2>/dev/null; then
+            echo "Login password for '$USER' set OK"
+          else
+            echo "::warning::login password for '$USER' still not accepted after reset"
+          fi
 
           # Remote Management + legacy VNC password (the official way)
           sudo "$KICKSTART" -activate -configure -access -on \
@@ -130,7 +137,7 @@ jobs:
           echo "--- local users (UID >= 500)"
           dscl . -list /Users UniqueID | awk '$2 >= 500 {print $1}'
           for U in $(dscl . -list /Users UniqueID | awk '$2 >= 500 {print $1}'); do
-            sudo dscl . -passwd "/Users/$U" "$VNC_PASSWORD" || echo "::warning::could not set password for $U"
+            sudo sysadminctl -resetPasswordFor "$U" -newPassword "$VNC_PASSWORD" 2>&1 || echo "::warning::could not set password for $U"
             if dscl . -authonly "$U" "$VNC_PASSWORD" 2>/dev/null; then
               echo "OK: '$U' accepts the secret password"
             else
