@@ -146,6 +146,22 @@ jobs:
             echo "Password: your VNC_PASSWORD secret (first 8 chars)"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Debug window (temporary)
+        run: |
+          sw_vers; uname -m; csrutil status || true
+          echo "--- listeners on 5900"
+          sudo lsof -nP -iTCP:"$VNC_PORT" | head || true
+          echo "--- RFB banner (should print RFB 003.xxx)"
+          sleep 2 | nc -w 3 127.0.0.1 "$VNC_PORT" | head -c 12 | od -c || true
+          echo "--- screensharing processes"
+          pgrep -lf 'screensharingd|ARDAgent' || true
+          echo ">>> NOW try connecting from your phone (waiting 120s) <<<"
+          sleep 120
+          echo "--- ngrok log"
+          tail -n 20 "$RUNNER_TEMP/ngrok.log" || true
+          echo "--- screensharingd log"
+          sudo log show --last 3m --style compact --predicate 'process == "screensharingd" OR process == "ARDAgent"' | tail -n 40 || true
+
       - name: Keep alive
         run: |
           END=$(( $(date +%s) + SESSION_MINUTES * 60 ))
