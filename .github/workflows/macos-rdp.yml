@@ -83,6 +83,45 @@ jobs:
           sudo launchctl list | grep -iE 'screensharing|ARD' || true
           exit 1
 
+      - name: Grant screen permissions (TCC)
+        run: |
+          KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+          SYS_DB="/Library/Application Support/com.apple.TCC/TCC.db"
+          USR_DB="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
+
+          echo "--- console user / display"
+          stat -f '%Su' /dev/console || true
+          pgrep -lx 'loginwindow|WindowServer' || true
+          screencapture -x "$RUNNER_TEMP/test.png" 2>&1 || true
+          ls -l "$RUNNER_TEMP/test.png" 2>&1 || true
+
+          grant() {  # $1=service  $2=client  $3=0 (bundle id) or 1 (path)
+            for DB in "$SYS_DB" "$USR_DB"; do
+              sudo sqlite3 "$DB" "INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,indirect_object_identifier,flags,last_modified) VALUES ('$1','$2',$3,2,4,1,'UNUSED',0,strftime('%s','now'));" \
+                || echo "::warning::TCC write failed: $1 / $2 / $DB"
+            done
+          }
+
+          for SVC in kTCCServiceScreenCapture kTCCServicePostEvent kTCCServiceAccessibility kTCCServiceListenEvent; do
+            grant "$SVC" com.apple.screensharing.agent 0
+            grant "$SVC" com.apple.RemoteDesktop.agent 0
+            grant "$SVC" /System/Library/CoreServices/RemoteManagement/screensharingd.bundle/Contents/MacOS/screensharingd 1
+            grant "$SVC" /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent 1
+          done
+
+          echo "--- TCC rows now"
+          sudo sqlite3 "$SYS_DB" "select service,client,auth_value from access where client like '%screensharing%' or client like '%RemoteDesktop%' or client like '%ARDAgent%';" || true
+
+          # Reload permissions and restart the daemons
+          sudo killall tccd screensharingd ARDAgent 2>/dev/null || true
+          sleep 2
+          sudo "$KICKSTART" -restart -agent
+          for _ in $(seq 1 15); do
+            nc -z 127.0.0.1 "$VNC_PORT" 2>/dev/null && break
+            sleep 2
+          done
+          nc -z 127.0.0.1 "$VNC_PORT" || { echo "::error::VNC port closed after restart"; exit 1; }
+
       - name: Install ngrok
         run: |
           case "$(uname -m)" in arm64) ARCH=arm64 ;; *) ARCH=amd64 ;; esac
