@@ -1,0 +1,47 @@
+name: macOS RDP (VNC via ngrok)
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: 'Session length in minutes (max ~340)'
+        required: false
+        default: '300'
+
+jobs:
+  mac-rdp:
+    runs-on: macos-latest
+    timeout-minutes: 360
+    steps:
+      - name: Enable Screen Sharing (VNC)
+        run: |
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate -configure -access -on -restart -agent -privs -all -allowAccessFor -allUsers
+          PW='${{ secrets.VNC_PASSWORD }}'
+          if [ -z "$PW" ]; then echo "ERROR: VNC_PASSWORD secret is not set (repo Settings -> Secrets and variables -> Actions)."; exit 1; fi
+          ENC=$(printf '%s' "$PW" | head -c 8 | perl -we 'BEGIN { @k=unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA"}; $_=<>; chomp; @p=unpack "C*",$_; foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }')
+          echo "$ENC" | sudo tee /Library/Preferences/com.apple.VNCSettings.txt > /dev/null
+          sudo chmod 600 /Library/Preferences/com.apple.VNCSettings.txt
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -restart -agent
+          echo "VNC enabled on port 5900"
+
+      - name: Install ngrok
+        run: brew install ngrok/ngrok/ngrok
+
+      - name: Start TCP tunnel to VNC
+        run: |
+          ngrok config add-authtoken '${{ secrets.NGROK_AUTHTOKEN }}'
+          (ngrok tcp 5900 --log stdout > /tmp/ngrok.log 2>&1 &)
+          sleep 10
+          python3 -c "import json,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:4040/api/tunnels',timeout=10)); print('VNC_ENDPOINT:', [t.get('public_url') for t in d.get('tunnels',[])])"
+
+      - name: Keep alive
+        run: |
+          MINUTES="${{ inputs.minutes }}"
+          echo "Connect a VNC client to the endpoint above. Password = your VNC_PASSWORD secret."
+          for i in $(seq 1 "$MINUTES"); do
+            sleep 60
+            if [ $((i % 30)) -eq 0 ]; then
+              python3 -c "import json,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:4040/api/tunnels',timeout=10)); print('VNC_ENDPOINT:', [t.get('public_url') for t in d.get('tunnels',[])])"
+            fi
+          done
