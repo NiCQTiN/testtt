@@ -4,50 +4,173 @@ on:
   workflow_dispatch:
     inputs:
       minutes:
-        description: 'Session length in minutes (max ~340)'
+        description: 'Session length in minutes (1-330)'
         required: false
         default: '300'
+
+permissions:
+  contents: read
+
+# A new run replaces the old one (free ngrok allows only one agent session)
+concurrency:
+  group: mac-rdp
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash   # -eo pipefail
 
 jobs:
   mac-rdp:
     runs-on: macos-latest
     timeout-minutes: 360
+    env:
+      VNC_PORT: '5900'
     steps:
-      - name: Enable Screen Sharing (VNC)
+      - name: Validate secrets and inputs
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+          MINUTES_IN: ${{ inputs.minutes }}
         run: |
-          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
-            -activate -configure -access -on -restart -agent -privs -all -allowAccessFor -allUsers
-          PW='${{ secrets.VNC_PASSWORD }}'
-          if [ -z "$PW" ]; then echo "ERROR: VNC_PASSWORD secret is not set (repo Settings -> Secrets and variables -> Actions)."; exit 1; fi
-          ENC=$(printf '%s' "$PW" | head -c 8 | perl -we 'BEGIN { @k=unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA"}; $_=<>; chomp; @p=unpack "C*",$_; foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }')
-          echo "$ENC" | sudo tee /Library/Preferences/com.apple.VNCSettings.txt > /dev/null
-          sudo chmod 600 /Library/Preferences/com.apple.VNCSettings.txt
-          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -restart -agent
-          echo "VNC enabled on port 5900"
+          [ -n "$VNC_PASSWORD" ] || { echo "::error::VNC_PASSWORD secret is not set (Settings -> Secrets and variables -> Actions)"; exit 1; }
+          [ -n "$NGROK_AUTHTOKEN" ] || { echo "::error::NGROK_AUTHTOKEN secret is not set"; exit 1; }
+          if [ "${#VNC_PASSWORD}" -gt 8 ]; then
+            echo "::warning::VNC only uses the first 8 characters of the password"
+          fi
 
-      - name: Install ngrok (direct download, no Homebrew)
+          MINUTES="${MINUTES_IN:-300}"
+          case "$MINUTES" in ''|*[!0-9]*) MINUTES=300 ;; esac
+          [ "$MINUTES" -lt 1 ] && MINUTES=1
+          [ "$MINUTES" -gt 330 ] && MINUTES=330
+          echo "SESSION_MINUTES=$MINUTES" >> "$GITHUB_ENV"
+
+      - name: Enable Screen Sharing (VNC)
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
-          ARCH=$(uname -m)
-          if [ "$ARCH" = "arm64" ]; then NGROK_ZIP="ngrok-v3-stable-darwin-arm64.zip"; else NGROK_ZIP="ngrok-v3-stable-darwin-amd64.zip"; fi
-          curl -fsSL -o /tmp/ngrok.zip "https://bin.equinox.io/c/bNyj1mQVY4c/$NGROK_ZIP"
-          unzip -o -q /tmp/ngrok.zip -d /tmp
-          sudo install -m 755 /tmp/ngrok /usr/local/bin/ngrok
+          KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+
+          # Never let the machine or screen sleep
+          sudo pmset -a sleep 0 displaysleep 0 disksleep 0 || true
+          defaults -currentHost write com.apple.screensaver idleTime 0 || true
+          nohup caffeinate -dimsu >/dev/null 2>&1 &
+
+          # Local account password (needed if the client asks for a macOS login)
+          sudo dscl . -passwd "/Users/$USER" "$VNC_PASSWORD" || true
+
+          # Remote Management + legacy VNC password (the official way)
+          sudo "$KICKSTART" -activate -configure -access -on \
+            -configure -allowAccessFor -allUsers \
+            -configure -privs -all
+          sudo "$KICKSTART" -configure -clientopts \
+            -setvnclegacy -vnclegacy yes \
+            -setvncpw -vncpw "$VNC_PASSWORD"
+
+          sudo launchctl enable system/com.apple.screensharing 2>/dev/null || true
+          sudo launchctl bootstrap system /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+          sudo "$KICKSTART" -restart -agent
+
+          # Wait until the port is really open
+          for _ in $(seq 1 30); do
+            if nc -z 127.0.0.1 "$VNC_PORT" 2>/dev/null; then
+              echo "VNC is listening on port $VNC_PORT"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::VNC port $VNC_PORT did not open"
+          sudo launchctl list | grep -iE 'screensharing|ARD' || true
+          exit 1
+
+      - name: Install ngrok
+        run: |
+          case "$(uname -m)" in arm64) ARCH=arm64 ;; *) ARCH=amd64 ;; esac
+          URL="https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-darwin-${ARCH}.zip"
+          if curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors -o "$RUNNER_TEMP/ngrok.zip" "$URL"; then
+            unzip -o -q "$RUNNER_TEMP/ngrok.zip" -d "$RUNNER_TEMP/ngrok"
+            sudo install -m 755 "$RUNNER_TEMP/ngrok/ngrok" /usr/local/bin/ngrok
+          else
+            echo "Direct download failed, falling back to Homebrew"
+            brew install ngrok/ngrok/ngrok
+          fi
           ngrok version
 
       - name: Start TCP tunnel to VNC
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
         run: |
-          ngrok config add-authtoken '${{ secrets.NGROK_AUTHTOKEN }}'
-          (ngrok tcp 5900 --log stdout > /tmp/ngrok.log 2>&1 &)
-          sleep 10
-          python3 -c "import json,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:4040/api/tunnels',timeout=10)); print('VNC_ENDPOINT:', [t.get('public_url') for t in d.get('tunnels',[])])"
+          # Helper: prints the current tunnel URL (empty if none)
+          cat > "$RUNNER_TEMP/get_endpoint.sh" <<'EOF'
+          #!/bin/sh
+          curl -fsS --max-time 5 http://127.0.0.1:4040/api/tunnels 2>/dev/null | python3 -c '
+          import sys, json
+          try:
+              t = json.load(sys.stdin).get("tunnels", [])
+              print(t[0]["public_url"] if t else "")
+          except Exception:
+              print("")
+          '
+          EOF
+          chmod +x "$RUNNER_TEMP/get_endpoint.sh"
+
+          ngrok config add-authtoken "$NGROK_AUTHTOKEN" > /dev/null
+          nohup ngrok tcp "$VNC_PORT" --log stdout > "$RUNNER_TEMP/ngrok.log" 2>&1 &
+
+          URL=""
+          for _ in $(seq 1 30); do
+            URL=$("$RUNNER_TEMP/get_endpoint.sh")
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+
+          if [ -z "$URL" ]; then
+            echo "::error::ngrok tunnel did not come up. Log:"
+            cat "$RUNNER_TEMP/ngrok.log"
+            if grep -q 8013 "$RUNNER_TEMP/ngrok.log"; then
+              echo "::error::ngrok needs a card on your account for TCP tunnels: https://dashboard.ngrok.com/settings#id-verification"
+            fi
+            exit 1
+          fi
+
+          HOSTPORT="${URL#tcp://}"
+          HOST="${HOSTPORT%:*}"
+          PORT="${HOSTPORT##*:}"
+          echo "VNC_ENDPOINT: $HOST:$PORT"
+          {
+            echo "### VNC endpoint"
+            echo '```'
+            echo "Host: $HOST"
+            echo "Port: $PORT"
+            echo '```'
+            echo "Password: your VNC_PASSWORD secret (first 8 chars)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep alive
         run: |
-          MINUTES="${{ inputs.minutes }}"
-          echo "Connect a VNC client to the endpoint above. Password = your VNC_PASSWORD secret."
-          for i in $(seq 1 "$MINUTES"); do
-            sleep 60
-            if [ $((i % 30)) -eq 0 ]; then
-              python3 -c "import json,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:4040/api/tunnels',timeout=10)); print('VNC_ENDPOINT:', [t.get('public_url') for t in d.get('tunnels',[])])"
+          END=$(( $(date +%s) + SESSION_MINUTES * 60 ))
+          LAST_URL=$("$RUNNER_TEMP/get_endpoint.sh")
+          NEXT_REPORT=$(( $(date +%s) + 1800 ))
+          echo "Session: $SESSION_MINUTES min. Cancel the run to stop it early."
+
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 30
+            URL=$("$RUNNER_TEMP/get_endpoint.sh")
+
+            if [ -z "$URL" ]; then
+              echo "::warning::ngrok tunnel is down, restarting..."
+              pkill -x ngrok || true
+              nohup ngrok tcp "$VNC_PORT" --log stdout > "$RUNNER_TEMP/ngrok.log" 2>&1 &
+              sleep 8
+              URL=$("$RUNNER_TEMP/get_endpoint.sh")
+            fi
+
+            NOW=$(date +%s)
+            if [ -n "$URL" ] && { [ "$URL" != "$LAST_URL" ] || [ "$NOW" -ge "$NEXT_REPORT" ]; }; then
+              echo "VNC_ENDPOINT: ${URL#tcp://}  (~$(( (END - NOW) / 60 )) min left)"
+              LAST_URL="$URL"
+              NEXT_REPORT=$(( NOW + 1800 ))
             fi
           done
+
+          echo "Session finished."
