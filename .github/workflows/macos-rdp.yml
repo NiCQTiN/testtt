@@ -22,7 +22,7 @@ defaults:
 
 jobs:
   mac-rdp:
-    runs-on: macos-latest
+    runs-on: xcode-27   # macOS 27 "Golden Gate", arm64 only
     timeout-minutes: 360
     env:
       VNC_PORT: '5900'
