@@ -122,6 +122,22 @@ jobs:
           done
           nc -z 127.0.0.1 "$VNC_PORT" || { echo "::error::VNC port closed after restart"; exit 1; }
 
+      - name: Set and verify login passwords
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          echo "Secret length: ${#VNC_PASSWORD} chars (a hidden newline/space would add 1)"
+          echo "--- local users (UID >= 500)"
+          dscl . -list /Users UniqueID | awk '$2 >= 500 {print $1}'
+          for U in $(dscl . -list /Users UniqueID | awk '$2 >= 500 {print $1}'); do
+            sudo dscl . -passwd "/Users/$U" "$VNC_PASSWORD" || echo "::warning::could not set password for $U"
+            if dscl . -authonly "$U" "$VNC_PASSWORD" 2>/dev/null; then
+              echo "OK: '$U' accepts the secret password"
+            else
+              echo "::warning::password check failed for '$U'"
+            fi
+          done
+
       - name: Install ngrok
         run: |
           case "$(uname -m)" in arm64) ARCH=arm64 ;; *) ARCH=amd64 ;; esac
