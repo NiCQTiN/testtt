@@ -56,15 +56,11 @@ jobs:
           defaults -currentHost write com.apple.screensaver idleTime 0 || true
           nohup caffeinate -dimsu >/dev/null 2>&1 &
 
-          # Local account password (needed if the client asks for a macOS login).
-          # dscl -passwd can fail with eDSAuthFailed even under sudo on this
-          # image; sysadminctl is the reliable way to force-reset it as root.
-          sudo sysadminctl -resetPasswordFor "$USER" -newPassword "$VNC_PASSWORD" 2>&1 | tee "$RUNNER_TEMP/pwreset.log" || true
-          if dscl . -authonly "$USER" "$VNC_PASSWORD" 2>/dev/null; then
-            echo "Login password for '$USER' set OK"
-          else
-            echo "::warning::login password for '$USER' still not accepted after reset"
-          fi
+          # NOTE: we deliberately do not touch the 'runner' account's password.
+          # It already has a Secure Token, and macOS refuses to change a
+          # Secure-Token account's password without another Secure-Token
+          # admin's *current* password (eDSAuthFailed otherwise). Creating a
+          # brand-new account (next step) has no such requirement.
 
           # Remote Management + legacy VNC password (the official way)
           sudo "$KICKSTART" -activate -configure -access -on \
@@ -129,21 +125,39 @@ jobs:
           done
           nc -z 127.0.0.1 "$VNC_PORT" || { echo "::error::VNC port closed after restart"; exit 1; }
 
-      - name: Set and verify login passwords
+      - name: Create login account
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
-          echo "Secret length: ${#VNC_PASSWORD} chars (a hidden newline/space would add 1)"
-          echo "--- local users (UID >= 500)"
-          dscl . -list /Users UniqueID | awk '$2 >= 500 {print $1}'
-          for U in $(dscl . -list /Users UniqueID | awk '$2 >= 500 {print $1}'); do
-            sudo sysadminctl -resetPasswordFor "$U" -newPassword "$VNC_PASSWORD" 2>&1 || echo "::warning::could not set password for $U"
-            if dscl . -authonly "$U" "$VNC_PASSWORD" 2>/dev/null; then
-              echo "OK: '$U' accepts the secret password"
-            else
-              echo "::warning::password check failed for '$U'"
-            fi
-          done
+          NEWUSER="ciadmin"
+
+          if dscl . -read "/Users/$NEWUSER" UniqueID >/dev/null 2>&1; then
+            echo "'$NEWUSER' already exists, just resetting its password (no secure token on it, so this is allowed)"
+            sudo sysadminctl -resetPasswordFor "$NEWUSER" -newPassword "$VNC_PASSWORD" 2>&1
+          else
+            echo "Creating admin account '$NEWUSER'"
+            sudo sysadminctl -addUser "$NEWUSER" -fullName "CI Admin" -password "$VNC_PASSWORD" -admin 2>&1
+          fi
+
+          sudo createhomedir -c -u "$NEWUSER" >/dev/null 2>&1 || true
+
+          # Skip the macOS first-login setup screens (Siri, Apple ID, etc.)
+          HOME_DIR="/Users/$NEWUSER"
+          sudo -u "$NEWUSER" defaults write "$HOME_DIR/Library/Preferences/com.apple.SetupAssistant" DidSeeCloudSetup -bool true 2>/dev/null || true
+          sudo -u "$NEWUSER" defaults write "$HOME_DIR/Library/Preferences/com.apple.SetupAssistant" GestureMovieSeen none 2>/dev/null || true
+          sudo -u "$NEWUSER" defaults write "$HOME_DIR/Library/Preferences/com.apple.SetupAssistant" LastSeenCloudProductVersion "$(sw_vers -productVersion)" 2>/dev/null || true
+          sudo -u "$NEWUSER" defaults write "$HOME_DIR/Library/Preferences/com.apple.SetupAssistant" LastSeenBuddyBuildVersion "$(sw_vers -buildVersion)" 2>/dev/null || true
+
+          # Make sure Screen Sharing explicitly allows this user too
+          KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+          sudo "$KICKSTART" -configure -users "$NEWUSER" -access -on -privs -all
+
+          echo "--- verifying login"
+          if dscl . -authonly "$NEWUSER" "$VNC_PASSWORD" 2>/dev/null; then
+            echo "OK: log in with username '$NEWUSER' and your VNC_PASSWORD secret"
+          else
+            echo "::error::'$NEWUSER' still doesn't accept the secret password"
+          fi
 
       - name: Install ngrok
         run: |
