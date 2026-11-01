@@ -25,8 +25,14 @@ jobs:
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -restart -agent
           echo "VNC enabled on port 5900"
 
-      - name: Install ngrok
-        run: brew install ngrok/ngrok/ngrok
+      - name: Install ngrok (direct download, no Homebrew)
+        run: |
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "arm64" ]; then NGROK_ZIP="ngrok-v3-stable-darwin-arm64.zip"; else NGROK_ZIP="ngrok-v3-stable-darwin-amd64.zip"; fi
+          curl -fsSL -o /tmp/ngrok.zip "https://bin.equinox.io/c/bNyj1mQVY4c/$NGROK_ZIP"
+          unzip -o -q /tmp/ngrok.zip -d /tmp
+          sudo install -m 755 /tmp/ngrok /usr/local/bin/ngrok
+          ngrok version
 
       - name: Start TCP tunnel to VNC
         run: |
