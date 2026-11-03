@@ -1,4 +1,4 @@
-name: macOS RDP (VNC via Tailscale)
+name: macOS RustDesk
 
 on:
   workflow_dispatch:
@@ -12,92 +12,66 @@ permissions:
   contents: read
 
 concurrency:
-  group: mac-rdp
+  group: mac-rustdesk
   cancel-in-progress: true
 
 defaults:
   run:
-    shell: bash   # -eo pipefail
+    shell: bash
 
 jobs:
-  mac-rdp:
-    runs-on: xcode-27   # macOS 27 "Golden Gate", arm64 only
+  mac-rustdesk:
+    runs-on: xcode-27   # macOS 27, arm64 only
     timeout-minutes: 360
-    env:
-      VNC_PORT: '5900'
-      HOMEBREW_NO_AUTO_UPDATE: '1'
-      HOMEBREW_NO_INSTALL_CLEANUP: '1'
     steps:
       - name: Validate secrets and inputs
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
-          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
           MINUTES_IN: ${{ inputs.minutes }}
         run: |
-          [ -n "$VNC_PASSWORD" ] || { echo "::error::VNC_PASSWORD secret is not set (Settings -> Secrets and variables -> Actions)"; exit 1; }
-          [ -n "$TS_AUTHKEY" ] || { echo "::error::TS_AUTHKEY secret is not set (Tailscale admin console -> Settings -> Keys)"; exit 1; }
-          if [ "${#VNC_PASSWORD}" -gt 8 ]; then
-            echo "::warning::VNC only uses the first 8 characters of the password"
-          fi
-
+          [ -n "$VNC_PASSWORD" ] || { echo "::error::VNC_PASSWORD secret is not set"; exit 1; }
           MINUTES="${MINUTES_IN:-300}"
           case "$MINUTES" in ''|*[!0-9]*) MINUTES=300 ;; esac
           [ "$MINUTES" -lt 1 ] && MINUTES=1
           [ "$MINUTES" -gt 330 ] && MINUTES=330
           echo "SESSION_MINUTES=$MINUTES" >> "$GITHUB_ENV"
 
-      - name: Enable Screen Sharing (VNC)
-        env:
-          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+      - name: Keep system awake
         run: |
-          KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
-
-          # Never let the machine or screen sleep
           sudo pmset -a sleep 0 displaysleep 0 disksleep 0 || true
-          defaults -currentHost write com.apple.screensaver idleTime 0 || true
           nohup caffeinate -dimsu >/dev/null 2>&1 &
 
-          # NOTE: we deliberately do not touch the 'runner' account's password.
-          # It already has a Secure Token, and macOS refuses to change a
-          # Secure-Token account's password without another Secure-Token
-          # admin's *current* password (eDSAuthFailed otherwise). Creating a
-          # brand-new account (next step) has no such requirement.
-
-          # Remote Management + legacy VNC password (the official way)
-          sudo "$KICKSTART" -activate -configure -access -on \
-            -configure -allowAccessFor -allUsers \
-            -configure -privs -all
-          sudo "$KICKSTART" -configure -clientopts \
-            -setvnclegacy -vnclegacy yes \
-            -setvncpw -vncpw "$VNC_PASSWORD"
-
-          sudo launchctl enable system/com.apple.screensharing 2>/dev/null || true
-          sudo launchctl bootstrap system /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
-          sudo "$KICKSTART" -restart -agent
-
-          # Wait until the port is really open
-          for _ in $(seq 1 30); do
-            if nc -z 127.0.0.1 "$VNC_PORT" 2>/dev/null; then
-              echo "VNC is listening on port $VNC_PORT"
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "::error::VNC port $VNC_PORT did not open"
-          sudo launchctl list | grep -iE 'screensharing|ARD' || true
-          exit 1
-
-      - name: Grant screen permissions (TCC)
+      - name: Download and install RustDesk
         run: |
-          KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+          API="https://api.github.com/repos/rustdesk/rustdesk/releases/latest"
+          URL=$(curl -fsSL "$API" | python3 -c '
+          import sys, json
+          d = json.load(sys.stdin)
+          for a in d["assets"]:
+              if a["name"].endswith("-aarch64.dmg"):
+                  print(a["browser_download_url"]); break
+          ')
+          [ -n "$URL" ] || { echo "::error::could not find an aarch64 .dmg in the latest RustDesk release"; exit 1; }
+          echo "Downloading $URL"
+          curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors -o "$RUNNER_TEMP/rustdesk.dmg" "$URL"
+
+          MOUNT_OUT=$(hdiutil attach "$RUNNER_TEMP/rustdesk.dmg" -nobrowse -quiet)
+          MOUNT=$(echo "$MOUNT_OUT" | grep -Eo '/Volumes/.*$' | tail -1)
+          [ -n "$MOUNT" ] || { echo "::error::could not mount the RustDesk dmg"; exit 1; }
+
+          APP=$(find "$MOUNT" -maxdepth 1 -name '*.app' | head -1)
+          [ -n "$APP" ] || { echo "::error::no .app found in the dmg"; hdiutil detach "$MOUNT" -quiet || true; exit 1; }
+
+          sudo cp -R "$APP" /Applications/RustDesk.app
+          hdiutil detach "$MOUNT" -quiet || true
+          sudo xattr -cr /Applications/RustDesk.app
+
+          echo "RustDesk installed"
+
+      - name: Grant permissions (TCC)
+        run: |
           SYS_DB="/Library/Application Support/com.apple.TCC/TCC.db"
           USR_DB="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
-
-          echo "--- console user / display"
-          stat -f '%Su' /dev/console || true
-          pgrep -lx 'loginwindow|WindowServer' || true
-          screencapture -x "$RUNNER_TEMP/test.png" 2>&1 || true
-          ls -l "$RUNNER_TEMP/test.png" 2>&1 || true
 
           grant() {  # $1=service  $2=client  $3=0 (bundle id) or 1 (path)
             for DB in "$SYS_DB" "$USR_DB"; do
@@ -106,132 +80,60 @@ jobs:
             done
           }
 
-          for SVC in kTCCServiceScreenCapture kTCCServicePostEvent kTCCServiceAccessibility kTCCServiceListenEvent; do
-            grant "$SVC" com.apple.screensharing.agent 0
-            grant "$SVC" com.apple.RemoteDesktop.agent 0
-            grant "$SVC" /System/Library/CoreServices/RemoteManagement/screensharingd.bundle/Contents/MacOS/screensharingd 1
-            grant "$SVC" /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent 1
+          for SVC in kTCCServiceScreenCapture kTCCServiceAccessibility kTCCServicePostEvent kTCCServiceListenEvent; do
+            grant "$SVC" com.carriez.RustDesk 0
+            grant "$SVC" /Applications/RustDesk.app/Contents/MacOS/RustDesk 1
           done
 
-          echo "--- TCC rows now"
-          sudo sqlite3 "$SYS_DB" "select service,client,auth_value from access where client like '%screensharing%' or client like '%RemoteDesktop%' or client like '%ARDAgent%';" || true
-
-          # Reload permissions and restart the daemons
-          sudo killall tccd screensharingd ARDAgent 2>/dev/null || true
+          sudo killall tccd 2>/dev/null || true
           sleep 2
-          sudo "$KICKSTART" -restart -agent
-          for _ in $(seq 1 15); do
-            nc -z 127.0.0.1 "$VNC_PORT" 2>/dev/null && break
-            sleep 2
-          done
-          nc -z 127.0.0.1 "$VNC_PORT" || { echo "::error::VNC port closed after restart"; exit 1; }
 
-      - name: Create login account
+      - name: Configure and start RustDesk
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
-          NEWUSER="ciadmin"
+          RD=/Applications/RustDesk.app/Contents/MacOS/RustDesk
 
-          if dscl . -read "/Users/$NEWUSER" UniqueID >/dev/null 2>&1; then
-            echo "'$NEWUSER' already exists, just resetting its password (no secure token on it, so this is allowed)"
-            sudo sysadminctl -resetPasswordFor "$NEWUSER" -newPassword "$VNC_PASSWORD" 2>&1
-          else
-            echo "Creating admin account '$NEWUSER'"
-            sudo sysadminctl -addUser "$NEWUSER" -fullName "CI Admin" -password "$VNC_PASSWORD" -admin 2>&1
-          fi
-
-          sudo createhomedir -c -u "$NEWUSER" >/dev/null 2>&1 || true
-
-          # Skip the macOS first-login setup screens (Siri, Apple ID, etc.)
-          HOME_DIR="/Users/$NEWUSER"
-          sudo -u "$NEWUSER" defaults write "$HOME_DIR/Library/Preferences/com.apple.SetupAssistant" DidSeeCloudSetup -bool true 2>/dev/null || true
-          sudo -u "$NEWUSER" defaults write "$HOME_DIR/Library/Preferences/com.apple.SetupAssistant" GestureMovieSeen none 2>/dev/null || true
-          sudo -u "$NEWUSER" defaults write "$HOME_DIR/Library/Preferences/com.apple.SetupAssistant" LastSeenCloudProductVersion "$(sw_vers -productVersion)" 2>/dev/null || true
-          sudo -u "$NEWUSER" defaults write "$HOME_DIR/Library/Preferences/com.apple.SetupAssistant" LastSeenBuddyBuildVersion "$(sw_vers -buildVersion)" 2>/dev/null || true
-
-          # Make sure Screen Sharing explicitly allows this user too
-          KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
-          sudo "$KICKSTART" -configure -users "$NEWUSER" -access -on -privs -all
-
-          echo "--- verifying login"
-          if dscl . -authonly "$NEWUSER" "$VNC_PASSWORD" 2>/dev/null; then
-            echo "OK: log in with username '$NEWUSER' and your VNC_PASSWORD secret"
-          else
-            echo "::error::'$NEWUSER' still doesn't accept the secret password"
-          fi
-
-      - name: Install and start Tailscale
-        env:
-          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
-        run: |
-          retry() { for _ in 1 2 3; do "$@" && return 0; sleep 5; done; return 1; }
-          retry brew install tailscale
-          sudo brew services start tailscale
-
-          for _ in $(seq 1 15); do
-            sudo tailscale status >/dev/null 2>&1 && break
+          RD_ID=""
+          for _ in $(seq 1 10); do
+            RD_ID=$("$RD" --get-id 2>/dev/null | tr -d '[:space:]')
+            [ -n "$RD_ID" ] && break
             sleep 2
           done
+          [ -n "$RD_ID" ] || { echo "::error::could not get a RustDesk ID"; exit 1; }
 
-          HOSTNAME="gh-mac-$(date +%s | tail -c 6)"
-          sudo tailscale up \
-            --authkey="$TS_AUTHKEY" \
-            --hostname="$HOSTNAME" \
-            --ssh=false \
-            --accept-dns=true \
-            --timeout=60s
+          nohup "$RD" --server > "$RUNNER_TEMP/rustdesk.log" 2>&1 &
+          sleep 5
 
-          TS_IP=""
-          for _ in $(seq 1 15); do
-            TS_IP=$(tailscale ip -4 2>/dev/null || true)
-            [ -n "$TS_IP" ] && break
-            sleep 2
-          done
-          if [ -z "$TS_IP" ]; then
-            echo "::error::Tailscale did not come up. Status:"
-            sudo tailscale status || true
-            exit 1
-          fi
+          "$RD" --password "$VNC_PASSWORD" || echo "::warning::could not set the permanent password"
 
-          TS_DNS=$(sudo tailscale status --json 2>/dev/null | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("Self",{}).get("DNSName","").rstrip("."))' 2>/dev/null || true)
-
-          echo "VNC_ENDPOINT: $TS_IP:$VNC_PORT"
+          echo "RUSTDESK_ID: $RD_ID"
           {
-            echo "### VNC endpoint (connect with bVNC / RealVNC Viewer)"
+            echo "### Connect with the RustDesk app"
             echo '```'
-            echo "Host: $TS_IP"
-            [ -n "$TS_DNS" ] && echo "# or host: $TS_DNS"
-            echo "Port: $VNC_PORT"
+            echo "ID: $RD_ID"
             echo '```'
-            echo "Password: your VNC_PASSWORD secret (first 8 chars)"
-            echo
-            echo "Your phone must have the Tailscale app installed and signed into the same account."
+            echo "Password: your VNC_PASSWORD secret"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep alive
         run: |
+          RD=/Applications/RustDesk.app/Contents/MacOS/RustDesk
           END=$(( $(date +%s) + SESSION_MINUTES * 60 ))
           NEXT_REPORT=$(( $(date +%s) + 1800 ))
           echo "Session: $SESSION_MINUTES min. Cancel the run to stop it early."
 
           while [ "$(date +%s)" -lt "$END" ]; do
             sleep 30
-
-            if ! nc -z 127.0.0.1 "$VNC_PORT" 2>/dev/null; then
-              echo "::warning::VNC port closed, restarting screen sharing..."
-              sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -restart -agent
-            fi
-
-            if ! sudo tailscale status >/dev/null 2>&1; then
-              echo "::warning::tailscaled looks down, restarting service..."
-              sudo brew services restart tailscale
+            if ! pgrep -f "RustDesk --server" >/dev/null 2>&1; then
+              echo "::warning::RustDesk server process not found, restarting..."
+              nohup "$RD" --server > "$RUNNER_TEMP/rustdesk.log" 2>&1 &
               sleep 5
             fi
-
             NOW=$(date +%s)
             if [ "$NOW" -ge "$NEXT_REPORT" ]; then
-              TS_IP=$(tailscale ip -4 2>/dev/null || echo "unknown")
-              echo "VNC_ENDPOINT: $TS_IP:$VNC_PORT  (~$(( (END - NOW) / 60 )) min left)"
+              RD_ID=$("$RD" --get-id 2>/dev/null | tr -d '[:space:]')
+              echo "RUSTDESK_ID: $RD_ID  (~$(( (END - NOW) / 60 )) min left)"
               NEXT_REPORT=$(( NOW + 1800 ))
             fi
           done
