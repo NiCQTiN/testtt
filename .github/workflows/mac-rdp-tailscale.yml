@@ -55,7 +55,13 @@ jobs:
           ')
           [ -n "$URL" ] || { echo "::error::could not find an aarch64 .dmg in the latest RustDesk release"; exit 1; }
           echo "Downloading $URL"
-          curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors -o "$RUNNER_TEMP/rustdesk.dmg" "$URL"
+          if ! curl -fSL --retry 5 --retry-delay 3 -o "$RUNNER_TEMP/rustdesk.dmg" "$URL"; then
+            echo "::error::download failed (exit $?). Response headers:"
+            curl -sIL "$URL" || true
+            exit 1
+          fi
+          ls -la "$RUNNER_TEMP/rustdesk.dmg"
+          file "$RUNNER_TEMP/rustdesk.dmg" || true
 
           MOUNT_OUT=$(hdiutil attach "$RUNNER_TEMP/rustdesk.dmg" -nobrowse -quiet)
           MOUNT=$(echo "$MOUNT_OUT" | grep -Eo '/Volumes/.*$' | tail -1)
