@@ -116,10 +116,10 @@ jobs:
           done
           [ -n "$RD_ID" ] || { echo "::error::could not get a RustDesk ID"; exit 1; }
 
-          nohup "$RD" --server > "$RUNNER_TEMP/rustdesk.log" 2>&1 &
+          sudo nohup "$RD" --server > "$RUNNER_TEMP/rustdesk.log" 2>&1 &
           sleep 5
 
-          "$RD" --password "$VNC_PASSWORD" || echo "::warning::could not set the permanent password"
+          sudo "$RD" --password "$VNC_PASSWORD" || echo "::warning::could not set the permanent password"
 
           echo "RUSTDESK_ID: $RD_ID"
           {
@@ -141,7 +141,7 @@ jobs:
             sleep 30
             if ! pgrep -f "RustDesk --server" >/dev/null 2>&1; then
               echo "::warning::RustDesk server process not found, restarting..."
-              nohup "$RD" --server > "$RUNNER_TEMP/rustdesk.log" 2>&1 &
+              sudo nohup "$RD" --server > "$RUNNER_TEMP/rustdesk.log" 2>&1 &
               sleep 5
             fi
             NOW=$(date +%s)
