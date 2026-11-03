@@ -42,9 +42,11 @@ jobs:
           nohup caffeinate -dimsu >/dev/null 2>&1 &
 
       - name: Download and install RustDesk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           API="https://api.github.com/repos/rustdesk/rustdesk/releases/latest"
-          URL=$(curl -fsSL "$API" | python3 -c '
+          URL=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$API" | python3 -c '
           import sys, json
           d = json.load(sys.stdin)
           for a in d["assets"]:
