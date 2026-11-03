@@ -60,18 +60,24 @@ jobs:
             curl -sIL "$URL" || true
             exit 1
           fi
-          ls -la "$RUNNER_TEMP/rustdesk.dmg"
-          file "$RUNNER_TEMP/rustdesk.dmg" || true
-
-          MOUNT_OUT=$(hdiutil attach "$RUNNER_TEMP/rustdesk.dmg" -nobrowse -quiet)
-          MOUNT=$(echo "$MOUNT_OUT" | grep -Eo '/Volumes/.*$' | tail -1)
-          [ -n "$MOUNT" ] || { echo "::error::could not mount the RustDesk dmg"; exit 1; }
+          PLIST=$(hdiutil attach "$RUNNER_TEMP/rustdesk.dmg" -nobrowse -plist)
+          MOUNT=$(echo "$PLIST" | python3 -c '
+          import sys, plistlib
+          d = plistlib.loads(sys.stdin.buffer.read())
+          for e in d.get("system-entities", []):
+              mp = e.get("mount-point")
+              if mp:
+                  print(mp)
+                  break
+          ')
+          [ -n "$MOUNT" ] || { echo "::error::could not find a mount point for the RustDesk dmg"; echo "$PLIST"; exit 1; }
+          echo "Mounted at: $MOUNT"
 
           APP=$(find "$MOUNT" -maxdepth 1 -name '*.app' | head -1)
           [ -n "$APP" ] || { echo "::error::no .app found in the dmg"; hdiutil detach "$MOUNT" -quiet || true; exit 1; }
 
           sudo cp -R "$APP" /Applications/RustDesk.app
-          hdiutil detach "$MOUNT" -quiet || true
+          hdiutil detach "$MOUNT" -quiet || hdiutil detach "$MOUNT" -force || true
           sudo xattr -cr /Applications/RustDesk.app
 
           echo "RustDesk installed"
