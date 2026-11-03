@@ -107,19 +107,22 @@ jobs:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
           RD=/Applications/RustDesk.app/Contents/MacOS/RustDesk
+          # Run every invocation as root so --get-id, --server and --password
+          # all read/write the SAME config (mixing sudo and non-sudo calls
+          # splits them into two different configs with two different IDs).
+
+          sudo nohup "$RD" --server > "$RUNNER_TEMP/rustdesk.log" 2>&1 &
+          sleep 8
+
+          sudo "$RD" --password "$VNC_PASSWORD" || echo "::warning::could not set the permanent password"
 
           RD_ID=""
           for _ in $(seq 1 10); do
-            RD_ID=$("$RD" --get-id 2>/dev/null | tr -d '[:space:]')
+            RD_ID=$(sudo "$RD" --get-id 2>/dev/null | tr -d '[:space:]')
             [ -n "$RD_ID" ] && break
             sleep 2
           done
-          [ -n "$RD_ID" ] || { echo "::error::could not get a RustDesk ID"; exit 1; }
-
-          sudo nohup "$RD" --server > "$RUNNER_TEMP/rustdesk.log" 2>&1 &
-          sleep 5
-
-          sudo "$RD" --password "$VNC_PASSWORD" || echo "::warning::could not set the permanent password"
+          [ -n "$RD_ID" ] || { echo "::error::could not get a RustDesk ID"; cat "$RUNNER_TEMP/rustdesk.log" || true; exit 1; }
 
           echo "RUSTDESK_ID: $RD_ID"
           {
@@ -146,7 +149,7 @@ jobs:
             fi
             NOW=$(date +%s)
             if [ "$NOW" -ge "$NEXT_REPORT" ]; then
-              RD_ID=$("$RD" --get-id 2>/dev/null | tr -d '[:space:]')
+              RD_ID=$(sudo "$RD" --get-id 2>/dev/null | tr -d '[:space:]')
               echo "RUSTDESK_ID: $RD_ID  (~$(( (END - NOW) / 60 )) min left)"
               NEXT_REPORT=$(( NOW + 1800 ))
             fi
